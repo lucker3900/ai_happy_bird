@@ -10,6 +10,10 @@ from typing import List, Tuple
 import pickle
 from bird import Bird  # 导入已有的Bird类
 from pipe import Pipe  # 导入已有的Pipe类
+import time
+import tkinter as tk
+from tkinter import ttk
+import threading
 
 # 设置日志
 logging.basicConfig(
@@ -34,14 +38,162 @@ class GenerationReporter(neat.reporting.BaseReporter):
     def start_generation(self, generation):
         self.game.generation = generation
 
+class StatsWindow:
+    def __init__(self):
+        # 使用更小的字体
+        self.font = pygame.font.Font('freesansbold.ttf', 16)
+        self.stats_text = ""
+        self.history_text = []  # 存储历史记录
+        
+    def draw(self, window, game_surface):
+        """绘制统计信息"""
+        # 在主窗口上绘制游戏画面和统计信息
+        window.fill((50, 50, 50))  # 深灰色背景
+        window.blit(game_surface, (0, 0))
+        
+        x = SCREEN_WIDTH + 20
+        y = 10
+        
+        # 先绘制当前代的信息
+        if self.stats_text.strip():
+            for line in self.stats_text.split('\n'):
+                if line.strip():
+                    text_surface = self.font.render(line, True, (255, 255, 255))
+                    window.blit(text_surface, (x, y))
+                    y += 20
+                else:
+                    y += 10
+            
+            # 在当前代和历史记录之间添加蓝色分隔线
+            if self.history_text:
+                y += 5  # 给分隔线留出空间
+                pygame.draw.line(window, (0, 150, 255), 
+                               (SCREEN_WIDTH + 10, y), 
+                               (SCREEN_WIDTH + 380, y), 2)
+                y += 15  # 分隔线后的间距
+        
+        # 绘制历史记录
+        for i, old_text in enumerate(self.history_text):
+            for line in old_text.split('\n'):
+                if line.strip():
+                    text_surface = self.font.render(line, True, (200, 200, 200))
+                    window.blit(text_surface, (x, y))
+                    y += 20
+                else:
+                    y += 10
+            
+            # 在每条历史记录之间添加蓝色分隔线（除了最后一条）
+            if i < len(self.history_text) - 1:
+                y += 5
+                pygame.draw.line(window, (0, 150, 255), 
+                               (SCREEN_WIDTH + 10, y), 
+                               (SCREEN_WIDTH + 380, y), 2)
+                y += 15
+
+    def update_stats(self, stats_text, is_generation_end=False):
+        """更新统计信息"""
+        if is_generation_end:
+            # 将当前信息添加到历史记录的开头
+            self.history_text.insert(0, self.stats_text)
+            # 只保留最近几代的历史
+            self.history_text = self.history_text[:3]
+        self.stats_text = stats_text
+
+class DetailedReporter(neat.reporting.BaseReporter):
+    """自定义报告器，用于详细显示训练过程"""
+    def __init__(self, game):
+        self.game = game
+        self.generation = None
+        self.generation_start_time = None
+        self.generation_times = []
+        self.num_extinctions = 0
+
+    def start_generation(self, generation):
+        """当新的一代开始时调用"""
+        self.generation = generation
+        self.generation_start_time = time.time()
+        
+        # 构建初始显示文本，去掉多余的空行
+        stats_text = f"""******* Running generation {generation} *******
+Population's average fitness: 0.00000 
+Best fitness: 0.00000
+Population size: {len(self.game.birds)}
+Alive: {len(self.game.birds)}
+Score: 0
+ID    age  size  fitness  adj fit  stag
+====  ===  ====  =======  =======  ===="""
+        self.update_display(stats_text)
+
+    def end_generation(self, config, population, species_set):
+        """当一代结束时调用"""
+        ng = len(population)
+        ns = len(species_set.species)
+        
+        # 计算适应度统计
+        fit_mean = np.mean([c.fitness for c in population.values()])
+        fit_std = np.std([c.fitness for c in population.values()])
+        fit_max = np.max([c.fitness for c in population.values()])
+        
+        # 构建显示文本
+        stats_text = f"""
+******* Generation {self.generation} Summary *******
+
+Population's average fitness: {fit_mean:.5f} 
+Standard deviation: {fit_std:.5f}
+Best fitness: {fit_max:.5f}
+
+Population size: {ng}
+Species count: {ns}
+
+ID    age  size  fitness  adj fit  stag
+====  ===  ====  =======  =======  ===="""
+        
+        # 添加物种信息
+        for sid, s in species_set.species.items():
+            a = self.generation - s.created
+            n = len(s.members)
+            f = "--" if s.fitness is None else f"{s.fitness:.1f}"
+            af = "--" if s.adjusted_fitness is None else f"{s.adjusted_fitness:.3f}"
+            st = self.generation - s.last_improved
+            stats_text += f"\n{sid:<4}  {a:>3}  {n:>4}  {f:>7}  {af:>7}  {st:>4}"
+        
+        # 添加时间信息
+        elapsed = time.time() - self.generation_start_time
+        self.generation_times.append(elapsed)
+        stats_text += f"\nGeneration time: {elapsed:.3f} sec"
+        
+        if len(self.generation_times) > 0:
+            mean_time = np.mean(self.generation_times)
+            stats_text += f"\nMean generation time: {mean_time:.3f} sec"
+        
+        stats_text += f"\nTotal extinctions: {self.num_extinctions}"
+        
+        # 更新显示时标记这是代的结束
+        self.update_display(stats_text, is_generation_end=True)
+
+    def species_stagnant(self, sid, species):
+        """当物种停滞时调用"""
+        self.num_extinctions += 1
+
+    def update_display(self, stats_text, is_generation_end=False):
+        """更新显示窗口"""
+        self.game.stats_window.update_stats(stats_text, is_generation_end)
+
 class Game:
     def __init__(self):
         pygame.init()
         pygame.mixer.init()
         pygame.font.init()  # 初始化字体模块
         
-        self.window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        # 创建一个更宽的窗口来容纳游戏和统计信息
+        self.window = pygame.display.set_mode((SCREEN_WIDTH + 400, SCREEN_HEIGHT))
         pygame.display.set_caption("NEAT Flappy Bird")
+        
+        # 创建主游戏surface
+        self.game_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+        
+        # 初始化统计窗口
+        self.stats_window = StatsWindow()
         
         # 初始化字体
         try:
@@ -110,7 +262,7 @@ class Game:
         
         # 绘制主射线（指向管道中心）
         pygame.draw.line(
-            self.window,
+            self.game_surface,
             (255, 0, 0),  # 红色
             bird_pos,
             target_pos,
@@ -126,11 +278,11 @@ class Game:
                     
                     # 计算空隙中间点
                     gap_center_x = top_pipe.rect.centerx
-                    gap_center_y = (top_pipe.rect.bottom + bottom_pipe.rect.top) / 2
+                    gap_center_y = (top_pipe.rect.bottom + bottom_pipe.rect.top) / 2 + 70
                     
-                    # 绘制射线
+                    # 绘制射线  
                     pygame.draw.line(
-                        self.window,
+                        self.game_surface,
                         (0, 255, 0),  # 绿色
                         (gap_center_x - 20, gap_center_y),  # 左端点
                         (gap_center_x + 20, gap_center_y),  # 右端点
@@ -140,11 +292,11 @@ class Game:
     def draw_debug_info(self, bird, pipes):
         """绘制调试信息，包括物体边框和视觉传感器"""
         # 1. 绘制小鸟的边框
-        pygame.draw.rect(self.window, (255, 0, 0), bird.rect, 2)
+        pygame.draw.rect(self.game_surface, (255, 0, 0), bird.rect, 2)
         
         # 2. 绘制管道的边框
         for pipe in pipes:
-            pygame.draw.rect(self.window, (255, 0, 0), pipe.rect, 2)
+            pygame.draw.rect(self.game_surface, (255, 0, 0), pipe.rect, 2)
         
         # 3. 绘制视觉传感器射线
         if not pipes:
@@ -158,7 +310,7 @@ class Game:
         
         # 绘制主射线（从小鸟到目标点）
         pygame.draw.line(
-            self.window,
+            self.game_surface,
             (255, 0, 0),  # 红色
             bird_pos,
             target_pos,
@@ -256,27 +408,49 @@ class Game:
                         self.nets.pop(x)
                         self.ge.pop(x)
 
-                # 绘制游戏画面
-                self.window.blit(self.bg_img, (0, 0))
-                self.pipe_sprite.draw(self.window)
+                # 在game_surface上绘制游戏画面
+                self.game_surface.blit(self.bg_img, (0, 0))
+                self.pipe_sprite.draw(self.game_surface)
                 
                 for bird in self.birds:
                     self.draw_debug_info(bird, pipe_list)
-                    self.window.blit(bird.image, bird.rect)
+                    self.game_surface.blit(bird.image, bird.rect)
                     
-                self.window.blit(self.ground_img, (0, SCREEN_HEIGHT - 100))
+                self.game_surface.blit(self.ground_img, (0, SCREEN_HEIGHT - 100))
 
                 # 显示分数和文字
                 cc_text = self.font.render("CC无聊纯娱乐", True, (0, 0, 255))
-                self.window.blit(cc_text, (SCREEN_WIDTH / 2 - 100, 10))
+                self.game_surface.blit(cc_text, (SCREEN_WIDTH / 2 - 100, 10))
                 score_text = self.font.render(f"score:{str(self.score)}", True, (0, 0, 255))
-                self.window.blit(score_text, (SCREEN_WIDTH/2 - 50, 50))
-                gen_text = self.font.render(f"gen:{self.generation}", True, (0, 0, 255))
-                self.window.blit(gen_text, (SCREEN_WIDTH/2 - 50, 90))
-                birds_text = self.font.render(f"alive:{len(self.birds)}", True, (0, 0, 255))
-                self.window.blit(birds_text, (SCREEN_WIDTH/2 - 50, 130))
+                self.game_surface.blit(score_text, (SCREEN_WIDTH/2 - 50, 50))
 
-                pygame.display.update()
+                # 计算当前状态
+                current_fitness = np.mean([g.fitness for g in self.ge]) if self.ge else 0
+                max_fitness = max([g.fitness for g in self.ge]) if self.ge else 0
+                
+                # 更新统计信息时调整格式
+                stats_text = f"""
+******* Running generation {self.generation} *******
+
+Population's average fitness: {current_fitness:.5f}
+Best fitness: {max_fitness:.5f}
+
+Population size: {len(self.birds)}
+Alive: {len(self.birds)}
+Score: {self.score}
+
+ID    age  size  fitness  adj fit  stag
+====  ===  ====  =======  =======  ===="""
+
+                # 添加对齐的数据行
+                for i, (genome_id, genome) in enumerate(zip(range(len(self.ge)), self.ge)):
+                    if i < 5:  # 只显示前5个物种的信息
+                        stats_text += f"\n{i:<4}  {0:>3}  {3:>4}  {genome.fitness:>7.1f}  {'-':>7}  {0:>4}"
+
+                # 更新显示（不再添加分隔行和下一代标题）
+                self.stats_window.update_stats(stats_text)
+                self.stats_window.draw(self.window, self.game_surface)
+                pygame.display.flip()
 
                 # 当所有小鸟死亡时
                 if len(self.birds) == 0:
@@ -287,39 +461,19 @@ def run_neat(config_path):
     """运行NEAT算法"""
     try:
         print(f"正在读取配置文件: {config_path}")
-        
-        # 先读取原配置文件
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config_content = f.read()
-            
-        # 创建临时配置文件（移除中文注释）
-        temp_config_path = os.path.join(os.path.dirname(__file__), "temp_config.txt")
-        with open(temp_config_path, 'w') as f:
-            # 移除包含中文的注释行
-            cleaned_content = '\n'.join(line for line in config_content.split('\n') 
-                                      if not line.strip().startswith('#'))
-            f.write(cleaned_content)
-            
-        # 使用临时配置文件
         config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
                            neat.DefaultSpeciesSet, neat.DefaultStagnation,
-                           temp_config_path)
+                           config_path)
         
-        # 删除临时配置文件
-        os.remove(temp_config_path)
-        
-        print("配置文件读取成功，初始化种群...")
         p = neat.Population(config)
-        
-        # 添加统计报告
-        p.add_reporter(neat.StdOutReporter(True))
-        stats = neat.StatisticsReporter()
-        p.add_reporter(stats)
         
         # 创建游戏实例
         game = Game()
         
-        print("开始训练...")
+        # 添加详细报告器（传入game实例）
+        detailed_reporter = DetailedReporter(game)
+        p.add_reporter(detailed_reporter)
+        
         # 运行进化过程
         winner = p.run(game.eval_genomes)
         
@@ -327,10 +481,8 @@ def run_neat(config_path):
         with open("best.pickle", "wb") as f:
             pickle.dump(winner, f)
             
-    except pygame.error:  # 捕获pygame退出异常
+    except pygame.error:
         print("训练被用户终止")
-    except FileNotFoundError as e:
-        print(f"找不到配置文件: {e}")
     except Exception as e:
         print(f"发生错误: {e}")
         logging.error(f"Error in run_neat: {e}")

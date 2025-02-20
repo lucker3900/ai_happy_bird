@@ -24,6 +24,9 @@ SCREEN_HEIGHT = 600
 FPS = 60
 PIPE_FREQUENCY = 1500  # 管道生成频率
 
+#分数记录
+game_score = 0
+
 class GenerationReporter(neat.reporting.BaseReporter):
     def __init__(self, game):
         self.game = game
@@ -35,15 +38,24 @@ class Game:
     def __init__(self):
         pygame.init()
         pygame.mixer.init()
+        pygame.font.init()  # 初始化字体模块
         
         self.window = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
         pygame.display.set_caption("NEAT Flappy Bird")
+        
+        # 初始化字体
+        try:
+            self.font = pygame.font.Font("微软正黑体.ttf", 30)
+        except:
+            # 如果找不到指定字体，使用系统默认字体
+            self.font = pygame.font.Font(None, 30)
         
         self.pipe_distance = 150
         self.generation = 0
         self.birds = []
         self.nets = []
         self.ge = []
+        self.score = 0  # 作为类属性
         
         self.load_resources()
         
@@ -60,7 +72,7 @@ class Game:
         except Exception as e:
             logging.error(f"Error loading resources: {e}")
             raise
-            
+
     def create_pipe(self):
         """创建新的管道"""
         pipe_y = random.randint(-100, 100)
@@ -77,6 +89,7 @@ class Game:
             img=self.pipe_top_img, 
             is_top=True   # 明确指定参数名
         )
+
         return pipe_top, pipe_btm
 
     def get_pipe_center(self, pipes):
@@ -103,31 +116,26 @@ class Game:
             target_pos,
             2  # 线宽
         )
-        
-        # 绘制扇形射线
-        angles = np.linspace(-30, 30, 10)  # 10条射线，覆盖60度角
-        for angle in angles:
-            rad = math.radians(angle)
-            direction = target_pos - bird_pos
-            length = np.linalg.norm(direction)
-            
-            # 旋转向量
-            rotated = np.array([
-                direction[0] * math.cos(rad) - direction[1] * math.sin(rad),
-                direction[0] * math.sin(rad) + direction[1] * math.cos(rad)
-            ])
-            
-            # 归一化并设置长度
-            rotated = rotated / np.linalg.norm(rotated) * length
-            end_pos = bird_pos + rotated
-            
-            pygame.draw.line(
-                self.window,
-                (255, 0, 0),
-                bird_pos,
-                end_pos,
-                1
-            )
+        # 绘制上下管道空隙中间的射线
+        if len(pipes) >= 2:
+            for i in range(0, len(pipes), 2):
+                if i + 1 < len(pipes):
+                    # 获取上下管道
+                    top_pipe = pipes[i] if pipes[i].is_top else pipes[i+1]
+                    bottom_pipe = pipes[i+1] if not pipes[i+1].is_top else pipes[i]
+                    
+                    # 计算空隙中间点
+                    gap_center_x = top_pipe.rect.centerx
+                    gap_center_y = (top_pipe.rect.bottom + bottom_pipe.rect.top) / 2
+                    
+                    # 绘制射线
+                    pygame.draw.line(
+                        self.window,
+                        (0, 255, 0),  # 绿色
+                        (gap_center_x - 20, gap_center_y),  # 左端点
+                        (gap_center_x + 20, gap_center_y),  # 右端点
+                        2  # 线宽
+                    )
 
     def draw_debug_info(self, bird, pipes):
         """绘制调试信息，包括物体边框和视觉传感器"""
@@ -148,251 +156,197 @@ class Game:
         pipe_center = self.get_pipe_center(pipes)
         target_pos = np.array(pipe_center)
         
-        # 计算射线角度范围
-        num_rays = 20  # 射线数量
-        angle_range = 60  # 总角度范围
-        angles = np.linspace(-angle_range/2, angle_range/2, num_rays)
-        
-        # 绘制每条射线
-        for angle in angles:
-            rad = math.radians(angle)
-            direction = target_pos - bird_pos
-            length = np.linalg.norm(direction)
-            
-            # 旋转向量
-            rotated = np.array([
-                direction[0] * math.cos(rad) - direction[1] * math.sin(rad),
-                direction[0] * math.sin(rad) + direction[1] * math.cos(rad)
-            ])
-            
-            # 归一化并设置长度
-            rotated = rotated / np.linalg.norm(rotated) * length
-            end_pos = bird_pos + rotated
-            
-            # 绘制射线
-            pygame.draw.line(
-                self.window,
-                (255, 0, 0),  # 红色
-                bird_pos,
-                end_pos,
-                1  # 线宽
-            )
+        # 绘制主射线（从小鸟到目标点）
+        pygame.draw.line(
+            self.window,
+            (255, 0, 0),  # 红色
+            bird_pos,
+            target_pos,
+            2  # 线宽
+        )
 
     def eval_genomes(self, genomes, config):
         """评估每个基因组"""
-        self.birds = []
-        self.nets = []
-        self.ge = []
-        self.pipe_sprite = pygame.sprite.Group()
-        
-        # 初始化种群
-        for genome_id, genome in genomes:
-            net = neat.nn.FeedForwardNetwork.create(genome, config)
-            self.nets.append(net)
+        while True:
+            self.birds = []
+            self.nets = []
+            self.ge = []
+            self.pipe_sprite = pygame.sprite.Group()
+            self.score = 0  # 重置分数
             
-            bird = Bird(100, SCREEN_HEIGHT/2, self.bird_imgs)
-            bird.ground_height = SCREEN_HEIGHT - 100
-            self.birds.append(bird)
+            # 计算小鸟之间的垂直间距
+            total_birds = len(genomes)
+            available_height = SCREEN_HEIGHT - 200  # 留出上下边距
+            spacing = available_height / total_birds  # 动态计算间距
             
-            genome.fitness = 0
-            self.ge.append(genome)
-
-        clock = pygame.time.Clock()
-        running = True
-        score = 0
-        last_pipe_time = pygame.time.get_ticks()
-
-        while running and len(self.birds) > 0:
-            clock.tick(FPS)
-
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-
-            # 创建新管道
-            now = pygame.time.get_ticks()
-            if now - last_pipe_time > PIPE_FREQUENCY:
-                pipe_top, pipe_btm = self.create_pipe()
-                self.pipe_sprite.add(pipe_top, pipe_btm)
-                last_pipe_time = now
-
-            # 更新所有对象
-            self.pipe_sprite.update()
-            pipe_list = self.pipe_sprite.sprites()
-
-            # 对每个存活的小鸟进行神经网络控制
-            for x, bird in enumerate(self.birds):
-                # 增加存活奖励
-                self.ge[x].fitness += 0.1
+            # 初始化种群
+            for i, (genome_id, genome) in enumerate(genomes):
+                net = neat.nn.FeedForwardNetwork.create(genome, config)
+                self.nets.append(net)
                 
-                # 获取到最近管道中心的距离和角度
-                pipe_center = self.get_pipe_center(pipe_list)
-                bird_pos = np.array([bird.rect.centerx, bird.rect.centery])
-                target_pos = np.array(pipe_center)
+                # 设置垂直排列的起始位置
+                start_x = 100  # 固定X坐标
+                start_y = 100 + i * spacing  # 使用动态间距
                 
-                # 计算输入特征
-                dx = target_pos[0] - bird_pos[0]
-                dy = target_pos[1] - bird_pos[1]
-                velocity = bird.down_speed
+                bird = Bird(start_x, start_y, self.bird_imgs)
+                bird.ground_height = SCREEN_HEIGHT - 100
+                self.birds.append(bird)
                 
-                # 神经网络决策
-                output = self.nets[x].activate((dy, dx, velocity))
-                if output[0] > 0.5:
-                    bird.jump(True)
+                genome.fitness = 0
+                self.ge.append(genome)
 
-                bird.update()
+            clock = pygame.time.Clock()
+            running = True
+            last_pipe_time = pygame.time.get_ticks()
 
-                # 碰撞检测
-                if pygame.sprite.spritecollideany(bird, self.pipe_sprite) or \
-                   bird.rect.top <= 0 or bird.rect.bottom >= SCREEN_HEIGHT - 100:
-                    self.ge[x].fitness -= 1
-                    self.birds.pop(x)
-                    self.nets.pop(x)
-                    self.ge.pop(x)
+            while running and len(self.birds) > 0:
+                clock.tick(FPS)
 
-            # 绘制游戏画面
-            self.window.blit(self.bg_img, (0, 0))
-            self.pipe_sprite.draw(self.window)
-            
-            for bird in self.birds:
-                self.draw_debug_info(bird, pipe_list)
-                self.window.blit(bird.image, bird.rect)
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT:
+                        pygame.quit()
+                        raise pygame.error("User quit")
+
+                # 创建新管道
+                now = pygame.time.get_ticks()
+                if now - last_pipe_time > PIPE_FREQUENCY:
+                    pipe_top, pipe_btm = self.create_pipe()
+                    self.pipe_sprite.add(pipe_top, pipe_btm)
+                    last_pipe_time = now
+
+                # 更新所有对象
+                self.pipe_sprite.update()
+                pipe_list = self.pipe_sprite.sprites()
+                now = pygame.time.get_ticks()
+
+                if len(pipe_list) > 0:
+                    first_pipe = pipe_list[0]
+                    if bird.rect.left > first_pipe.rect.right and first_pipe.cross_pipe:
+                        print(f"第一根柱子坐标{first_pipe.rect.right}")
+                        self.score += 1
+                        first_pipe.cross_pipe = False
+
+                # 对每个存活的小鸟进行神经网络控制
+                for x, bird in enumerate(self.birds):
+                    # 增加存活奖励
+                    self.ge[x].fitness += 0.1
+                    
+                    # 获取到最近管道中心的距离和角度
+                    pipe_center = self.get_pipe_center(pipe_list)
+                    bird_pos = np.array([bird.rect.centerx, bird.rect.centery])
+                    target_pos = np.array(pipe_center)
+                    
+                    # 计算输入特征
+                    dx = target_pos[0] - bird_pos[0]
+                    dy = target_pos[1] - bird_pos[1]
+                    velocity = bird.down_speed
+                    
+                    # 神经网络决策
+                    output = self.nets[x].activate((dy, dx, velocity))
+                    if output[0] > 0.5:
+                        bird.jump(True)
+
+                    bird.update()
+
+                    # 碰撞检测
+                    if pygame.sprite.spritecollideany(bird, self.pipe_sprite) or \
+                       bird.rect.top <= 0 or bird.rect.bottom >= SCREEN_HEIGHT - 100:
+                        self.ge[x].fitness -= 1
+                        self.birds.pop(x)
+                        self.nets.pop(x)
+                        self.ge.pop(x)
+
+                # 绘制游戏画面
+                self.window.blit(self.bg_img, (0, 0))
+                self.pipe_sprite.draw(self.window)
                 
-            self.window.blit(self.ground_img, (0, SCREEN_HEIGHT - 100))
+                for bird in self.birds:
+                    self.draw_debug_info(bird, pipe_list)
+                    self.window.blit(bird.image, bird.rect)
+                    
+                self.window.blit(self.ground_img, (0, SCREEN_HEIGHT - 100))
 
-            # 在绘制信息之前更新generation
-            if len(self.birds) == 0:
-                self.generation += 1  # 当所有小鸟死亡时增加代数
+                # 显示分数和文字
+                cc_text = self.font.render("CC无聊纯娱乐", True, (0, 0, 255))
+                self.window.blit(cc_text, (SCREEN_WIDTH / 2 - 100, 10))
+                score_text = self.font.render(f"score:{str(self.score)}", True, (0, 0, 255))
+                self.window.blit(score_text, (SCREEN_WIDTH/2 - 50, 50))
+                gen_text = self.font.render(f"gen:{self.generation}", True, (0, 0, 255))
+                self.window.blit(gen_text, (SCREEN_WIDTH/2 - 50, 90))
+                birds_text = self.font.render(f"alive:{len(self.birds)}", True, (0, 0, 255))
+                self.window.blit(birds_text, (SCREEN_WIDTH/2 - 50, 130))
 
-            # 显示信息
-            font = pygame.font.Font(None, 36)
-            score_text = font.render(f"Birds Alive: {len(self.birds)}", True, (255, 255, 255))
-            gen_text = font.render(f"Generation: {self.generation}", True, (255, 255, 255))
-            
-            self.window.blit(score_text, (10, 10))
-            self.window.blit(gen_text, (10, 50))
-            
-            pygame.display.update()
+                pygame.display.update()
+
+                # 当所有小鸟死亡时
+                if len(self.birds) == 0:
+                    self.generation += 1  # 增加代数
+                    break  # 跳出内层循环，重新初始化种群
 
 def run_neat(config_path):
     """运行NEAT算法"""
     try:
-        # 使用UTF-8编码读取配置文件
-        with open(config_path, 'r', encoding='utf-8') as f:
-            config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
-                               neat.DefaultSpeciesSet, neat.DefaultStagnation,
-                               config_path)
+        print(f"正在读取配置文件: {config_path}")
         
+        # 先读取原配置文件
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config_content = f.read()
+            
+        # 创建临时配置文件（移除中文注释）
+        temp_config_path = os.path.join(os.path.dirname(__file__), "temp_config.txt")
+        with open(temp_config_path, 'w') as f:
+            # 移除包含中文的注释行
+            cleaned_content = '\n'.join(line for line in config_content.split('\n') 
+                                      if not line.strip().startswith('#'))
+            f.write(cleaned_content)
+            
+        # 使用临时配置文件
+        config = neat.Config(neat.DefaultGenome, neat.DefaultReproduction,
+                           neat.DefaultSpeciesSet, neat.DefaultStagnation,
+                           temp_config_path)
+        
+        # 删除临时配置文件
+        os.remove(temp_config_path)
+        
+        print("配置文件读取成功，初始化种群...")
         p = neat.Population(config)
         
         # 添加统计报告
         p.add_reporter(neat.StdOutReporter(True))
-        p.add_reporter(GenerationReporter(Game()))  # 添加generation reporter
         stats = neat.StatisticsReporter()
         p.add_reporter(stats)
         
         # 创建游戏实例
         game = Game()
         
+        print("开始训练...")
         # 运行进化过程
-        winner = p.run(game.eval_genomes, 50)  # 50代
+        winner = p.run(game.eval_genomes)
         
         # 保存最佳网络
         with open("best.pickle", "wb") as f:
             pickle.dump(winner, f)
             
+    except pygame.error:  # 捕获pygame退出异常
+        print("训练被用户终止")
+    except FileNotFoundError as e:
+        print(f"找不到配置文件: {e}")
     except Exception as e:
+        print(f"发生错误: {e}")
         logging.error(f"Error in run_neat: {e}")
         raise
 
-def create_config():
-    """创建NEAT配置文件"""
-    config_content = """[NEAT]
-fitness_criterion     = max
-fitness_threshold     = 100
-pop_size             = 50
-reset_on_extinction  = False
-
-[DefaultGenome]
-# node activation options
-activation_default      = tanh
-activation_mutate_rate = 0.0
-activation_options     = tanh
-
-# node aggregation options
-aggregation_default     = sum
-aggregation_mutate_rate = 0.0
-aggregation_options     = sum
-
-# node add/remove rates
-node_add_prob           = 0.2
-node_delete_prob       = 0.2
-
-# node bias options
-bias_init_mean          = 0.0
-bias_init_stdev         = 1.0
-bias_max_value          = 30.0
-bias_min_value          = -30.0
-bias_mutate_power       = 0.5
-bias_mutate_rate        = 0.7
-bias_replace_rate       = 0.1
-
-# node response options
-response_init_mean      = 1.0
-response_init_stdev     = 0.0
-response_max_value      = 30.0
-response_min_value      = -30.0
-response_mutate_power   = 0.0
-response_mutate_rate    = 0.0
-response_replace_rate   = 0.0
-
-# connection add/remove rates
-conn_add_prob           = 0.5
-conn_delete_prob        = 0.5
-
-# connection enable options
-enabled_default         = True
-enabled_mutate_rate    = 0.01
-
-# connection weight options
-weight_init_mean       = 0.0
-weight_init_stdev      = 1.0
-weight_max_value       = 30
-weight_min_value       = -30
-weight_mutate_power    = 0.5
-weight_mutate_rate     = 0.8
-weight_replace_rate    = 0.1
-
-# network parameters
-num_hidden             = 0
-num_inputs             = 3
-num_outputs            = 1
-
-# genome compatibility options
-compatibility_disjoint_coefficient = 1.0
-compatibility_weight_coefficient   = 0.5
-
-feed_forward            = True
-initial_connection      = full
-
-[DefaultSpeciesSet]
-compatibility_threshold = 3.0
-
-[DefaultStagnation]
-species_fitness_func = max
-max_stagnation      = 20
-species_elitism     = 2
-
-[DefaultReproduction]
-elitism            = 2
-survival_threshold = 0.2"""
-
-    config_path = os.path.join(os.path.dirname(__file__), "config-feedforward.txt")
-    with open(config_path, "w", encoding="utf-8") as f:
-        f.write(config_content)
-    return config_path
-
 if __name__ == "__main__":
-    config_path = create_config()  # 创建配置文件
-    run_neat(config_path)  # 运行NEAT 
+    # 获取配置文件的绝对路径
+    local_dir = os.path.dirname(__file__)
+    config_path = os.path.join(local_dir, "config-feedforward.txt")
+    
+    # 确保配置文件存在
+    if not os.path.exists(config_path):
+        print(f"配置文件不存在: {config_path}")
+        sys.exit(1)
+        
+    try:
+        run_neat(config_path)  # 运行NEAT 
+    except Exception as e:
+        print(f"错误: {e}") 

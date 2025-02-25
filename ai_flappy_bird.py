@@ -4,7 +4,6 @@ import numpy as np
 import random
 import os
 import sys
-import math
 import logging
 from typing import List, Tuple
 import pickle
@@ -13,7 +12,9 @@ from pipe import Pipe  # 导入已有的Pipe类
 import time
 import tkinter as tk
 from tkinter import ttk
-import threading
+import torch
+import glob
+import json
 
 # 设置日志
 logging.basicConfig(
@@ -30,6 +31,18 @@ PIPE_FREQUENCY = 1500  # 管道生成频率
 
 #分数记录
 game_score = 0
+
+# 添加性能相关的常量
+DRAW_DEBUG = False  # 关闭调试信息显示
+DEBUG_UPDATE_INTERVAL = 3  # 调试信息更新间隔（帧数）
+STATS_UPDATE_INTERVAL = 2  # 统计信息更新间隔（帧数）
+MAX_PIPE_PAIRS = 3  # 最大管道对数
+POPULATION_SIZE = 30  # 种群大小
+
+# 添加新的常量
+MIN_SCORE_TO_SAVE = 100  # 只保存达到这个分数的游戏数据
+MAX_TRAINING_FILES = 10  # 最多保存10个高分记录
+BACKUP_DIR = "training_data_backup"  # 备份目录
 
 class GenerationReporter(neat.reporting.BaseReporter):
     def __init__(self, game):
@@ -187,7 +200,7 @@ class Game:
         
         # 创建一个更宽的窗口来容纳游戏和统计信息
         self.window = pygame.display.set_mode((SCREEN_WIDTH + 400, SCREEN_HEIGHT))
-        pygame.display.set_caption("NEAT Flappy Bird")
+        pygame.display.set_caption("CC Happy Bird")
         
         # 创建主游戏surface
         self.game_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
@@ -208,8 +221,27 @@ class Game:
         self.nets = []
         self.ge = []
         self.score = 0  # 作为类属性
+        self.best_score = 0  # 当前运行的最佳分数
+        self.all_time_best_score = 0  # 历史最佳分数
+        self.scores_history = []  # 记录所有分数
+        self.checkpoint_interval = 10  # 每10代保存一次
+        self.model_dir = "checkpoints"  # 保存模型的目录
+        
+        # 创建保存模型的目录
+        if not os.path.exists(self.model_dir):
+            os.makedirs(self.model_dir)
         
         self.load_resources()
+        
+        # 尝试加载历史最佳分数
+        self.load_best_score()
+        
+        self.frame_count = 0
+        self.last_pipe_center = None
+        self.last_pipe = None
+        
+        # 创建sprite组用于优化碰撞检测
+        self.bird_group = pygame.sprite.Group()
         
     def load_resources(self):
         try:
@@ -290,68 +322,128 @@ class Game:
                     )
 
     def draw_debug_info(self, bird, pipes):
-        """绘制调试信息，包括物体边框和视觉传感器"""
-        # 1. 绘制小鸟的边框
-        pygame.draw.rect(self.game_surface, (255, 0, 0), bird.rect, 2)
-        
-        # 2. 绘制管道的边框
-        for pipe in pipes:
-            pygame.draw.rect(self.game_surface, (255, 0, 0), pipe.rect, 2)
-        
-        # 3. 绘制视觉传感器射线
-        if not pipes:
-            return
-        
-        bird_pos = np.array([bird.rect.centerx, bird.rect.centery])
-        
-        # 获取最近的管道间隙中心点
-        pipe_center = self.get_pipe_center(pipes)
-        target_pos = np.array(pipe_center)
-        
-        # 绘制主射线（从小鸟到目标点）
-        pygame.draw.line(
-            self.game_surface,
-            (255, 0, 0),  # 红色
-            bird_pos,
-            target_pos,
-            2  # 线宽
-        )
+        """移除调试信息绘制"""
+        pass  # 不绘制任何调试信息
+
+    def load_best_score(self):
+        """加载历史最佳分数"""
+        try:
+            if os.path.exists('best_score.txt'):
+                with open('best_score.txt', 'r') as f:
+                    self.all_time_best_score = int(f.read())
+                print(f"Loaded all-time best score: {self.all_time_best_score}")
+        except Exception as e:
+            print(f"Error loading best score: {e}")
+            
+    def save_best_score(self):
+        """保存历史最佳分数"""
+        try:
+            with open('best_score.txt', 'w') as f:
+                f.write(str(self.all_time_best_score))
+        except Exception as e:
+            print(f"Error saving best score: {e}")
+            
+    def save_checkpoint(self, genomes, generation):
+        """保存检查点和分数记录"""
+        try:
+            # 找到当前代中适应度最高的基因组
+            best_genome = None
+            best_fitness = float('-inf')
+            
+            for _, genome in genomes:
+                if genome.fitness is not None and genome.fitness > best_fitness:
+                    best_genome = genome
+                    best_fitness = genome.fitness
+            
+            if best_genome is None:
+                return  # 如果没有有效的基因组，直接返回
+            
+            # 更新最高分记录
+            if self.score > self.all_time_best_score:
+                self.all_time_best_score = self.score
+                self.save_best_score()
+                print(f"New all-time best score: {self.all_time_best_score}!")
+            
+            # 记录本次分数
+            self.scores_history.append({
+                'generation': generation,
+                'score': self.score,
+                'best_fitness': best_fitness
+            })
+            
+            # 保存分数历史
+            with open('scores_history.json', 'w') as f:
+                json.dump(self.scores_history, f, indent=2)
+            
+            checkpoint = {
+                'generation': generation,
+                'best_genome': best_genome,
+                'best_fitness': best_fitness,
+                'score': self.score,
+                'all_time_best_score': self.all_time_best_score
+            }
+            
+            # 保存常规检查点
+            if generation % self.checkpoint_interval == 0:
+                checkpoint_path = os.path.join(
+                    self.model_dir, 
+                    f'checkpoint_gen_{generation}.pth'
+                )
+                torch.save(checkpoint, checkpoint_path)
+            
+            # 如果是最佳分数，单独保存
+            if self.score > self.best_score:
+                self.best_score = self.score
+                best_model_path = os.path.join(
+                    self.model_dir, 
+                    f'best_model_score_{self.score}.pth'
+                )
+                torch.save(checkpoint, best_model_path)
+                print(f"New best score! Saved model with score {self.score}")
+                
+        except Exception as e:
+            print(f"Error in save_checkpoint: {e}")
 
     def eval_genomes(self, genomes, config):
-        """评估每个基因组"""
+        """优化的基因组评估"""
+        self.frame_count = 0
+        
         while True:
+            # 重置游戏状态
             self.birds = []
             self.nets = []
             self.ge = []
             self.pipe_sprite = pygame.sprite.Group()
-            self.score = 0  # 重置分数
-            
-            # 计算小鸟之间的垂直间距
-            total_birds = len(genomes)
-            available_height = SCREEN_HEIGHT - 200  # 留出上下边距
-            spacing = available_height / total_birds  # 动态计算间距
+            self.bird_group = pygame.sprite.Group()  # 使用新的group
+            self.score = 0
             
             # 初始化种群
             for i, (genome_id, genome) in enumerate(genomes):
+                if i >= POPULATION_SIZE:  # 限制种群大小
+                    break
+                    
                 net = neat.nn.FeedForwardNetwork.create(genome, config)
                 self.nets.append(net)
                 
-                # 设置垂直排列的起始位置
-                start_x = 100  # 固定X坐标
-                start_y = 100 + i * spacing  # 使用动态间距
-                
-                bird = Bird(start_x, start_y, self.bird_imgs)
+                bird = Bird(100, 100 + i * 20, self.bird_imgs)
                 bird.ground_height = SCREEN_HEIGHT - 100
                 self.birds.append(bird)
+                self.bird_group.add(bird)
                 
                 genome.fitness = 0
                 self.ge.append(genome)
+
+            # 如果没有有效的小鸟，直接进入下一代
+            if not self.birds:
+                self.generation += 1
+                break
 
             clock = pygame.time.Clock()
             running = True
             last_pipe_time = pygame.time.get_ticks()
 
-            while running and len(self.birds) > 0:
+            while running and self.birds:
+                self.frame_count += 1
                 clock.tick(FPS)
 
                 for event in pygame.event.get():
@@ -359,77 +451,125 @@ class Game:
                         pygame.quit()
                         raise pygame.error("User quit")
 
-                # 创建新管道
+                # 创建新管道（带数量限制）
                 now = pygame.time.get_ticks()
-                if now - last_pipe_time > PIPE_FREQUENCY:
+                if (now - last_pipe_time > PIPE_FREQUENCY and 
+                    len(self.pipe_sprite) < MAX_PIPE_PAIRS * 2):
                     pipe_top, pipe_btm = self.create_pipe()
                     self.pipe_sprite.add(pipe_top, pipe_btm)
                     last_pipe_time = now
 
-                # 更新所有对象
+                # 更新和清理管道
+                for pipe in list(self.pipe_sprite):
+                    if pipe.rect.right < 0:
+                        pipe.kill()
                 self.pipe_sprite.update()
+
+                # 优化的碰撞检测
+                collisions = pygame.sprite.groupcollide(
+                    self.bird_group, 
+                    self.pipe_sprite, 
+                    False, 
+                    False
+                )
+                
+                # 更新小鸟和神经网络
                 pipe_list = self.pipe_sprite.sprites()
-                now = pygame.time.get_ticks()
-
-                if len(pipe_list) > 0:
-                    first_pipe = pipe_list[0]
-                    if bird.rect.left > first_pipe.rect.right and first_pipe.cross_pipe:
-                        print(f"第一根柱子坐标{first_pipe.rect.right}")
-                        self.score += 1
-                        first_pipe.cross_pipe = False
-
-                # 对每个存活的小鸟进行神经网络控制
+                birds_to_remove = []
+                
+                # 先更新所有小鸟
                 for x, bird in enumerate(self.birds):
+                    # 检查碰撞
+                    if (bird in collisions or 
+                        bird.rect.top <= 0 or 
+                        bird.rect.bottom >= SCREEN_HEIGHT - 100):
+                        birds_to_remove.append(x)
+                        continue
+                        
                     # 增加存活奖励
                     self.ge[x].fitness += 0.1
                     
-                    # 获取到最近管道中心的距离和角度
-                    pipe_center = self.get_pipe_center(pipe_list)
-                    bird_pos = np.array([bird.rect.centerx, bird.rect.centery])
-                    target_pos = np.array(pipe_center)
+                    # 获取神经网络输入
+                    if pipe_list:
+                        pipe_center = self.get_pipe_center(pipe_list)
+                        bird_pos = np.array([bird.rect.centerx, bird.rect.centery])
+                        dx = pipe_center[0] - bird_pos[0]
+                        dy = pipe_center[1] - bird_pos[1]
+                        
+                        # 神经网络决策
+                        output = self.nets[x].activate((dy, dx, bird.down_speed))
+                        if output[0] > 0.5:
+                            bird.jump(True)
                     
-                    # 计算输入特征
-                    dx = target_pos[0] - bird_pos[0]
-                    dy = target_pos[1] - bird_pos[1]
-                    velocity = bird.down_speed
-                    
-                    # 神经网络决策
-                    output = self.nets[x].activate((dy, dx, velocity))
-                    if output[0] > 0.5:
-                        bird.jump(True)
-
                     bird.update()
 
-                    # 碰撞检测
-                    if pygame.sprite.spritecollideany(bird, self.pipe_sprite) or \
-                       bird.rect.top <= 0 or bird.rect.bottom >= SCREEN_HEIGHT - 100:
-                        self.ge[x].fitness -= 1
-                        self.birds.pop(x)
-                        self.nets.pop(x)
-                        self.ge.pop(x)
+                # 从后向前移除死亡的小鸟
+                for idx in sorted(birds_to_remove, reverse=True):
+                    try:
+                        if idx < len(self.birds):
+                            bird = self.birds[idx]
+                            self.ge[idx].fitness -= 1
+                            self.birds.pop(idx)
+                            self.nets.pop(idx)
+                            self.ge.pop(idx)
+                            self.bird_group.remove(bird)  # 直接使用bird对象而不是索引
+                    except Exception as e:
+                        print(f"Error removing bird at index {idx}: {e}")
+                        continue
 
-                # 在game_surface上绘制游戏画面
+                # 检查是否所有小鸟都死亡
+                if not self.birds:
+                    self.generation += 1
+                    break
+
+                # 绘制游戏画面
                 self.game_surface.blit(self.bg_img, (0, 0))
                 self.pipe_sprite.draw(self.game_surface)
                 
                 for bird in self.birds:
-                    self.draw_debug_info(bird, pipe_list)
                     self.game_surface.blit(bird.image, bird.rect)
-                    
+                
                 self.game_surface.blit(self.ground_img, (0, SCREEN_HEIGHT - 100))
 
-                # 显示分数和文字
-                cc_text = self.font.render("CC无聊纯娱乐", True, (0, 0, 255))
-                self.game_surface.blit(cc_text, (SCREEN_WIDTH / 2 - 100, 10))
-                score_text = self.font.render(f"score:{str(self.score)}", True, (0, 0, 255))
-                self.game_surface.blit(score_text, (SCREEN_WIDTH/2 - 50, 50))
-
-                # 计算当前状态
-                current_fitness = np.mean([g.fitness for g in self.ge]) if self.ge else 0
-                max_fitness = max([g.fitness for g in self.ge]) if self.ge else 0
+                # 更新统计信息（降低频率）
+                if self.frame_count % STATS_UPDATE_INTERVAL == 0:
+                    self.update_stats(genomes)
                 
-                # 更新统计信息时调整格式
-                stats_text = f"""
+                pygame.display.flip()
+
+                # 检查是否需要保存检查点
+                if self.frame_count % (FPS * 30) == 0:  # 每30秒保存一次
+                    self.save_checkpoint(genomes, self.generation)
+
+                if not self.birds:
+                    self.generation += 1
+                    break
+
+                # 更新管道和检查得分
+                pipe_list = self.pipe_sprite.sprites()
+                if pipe_list:
+                    # 检查每对管道
+                    for i in range(0, len(pipe_list), 2):
+                        if i + 1 < len(pipe_list):
+                            pipe = pipe_list[i]  # 使用上管道或下管道都可以
+                            # 当小鸟通过管道时增加分数
+                            if (pipe.rect.right < self.birds[0].rect.left and 
+                                pipe.cross_pipe):  # cross_pipe用于确保每个管道只计分一次
+                                self.score += 1
+                                pipe.cross_pipe = False
+                                # 增加通过管道的奖励
+                                for g in self.ge:
+                                    g.fitness += 5  # 给予额外的适应度奖励
+
+    def update_stats(self, genomes):
+        """更新统计信息"""
+        try:
+            # 计算当前状态
+            current_fitness = np.mean([g.fitness for g in self.ge]) if self.ge else 0
+            max_fitness = max([g.fitness for g in self.ge]) if self.ge else 0
+            
+            # 更新统计信息
+            stats_text = f"""
 ******* Running generation {self.generation} *******
 
 Population's average fitness: {current_fitness:.5f}
@@ -437,25 +577,135 @@ Best fitness: {max_fitness:.5f}
 
 Population size: {len(self.birds)}
 Alive: {len(self.birds)}
-Score: {self.score}
+Current Score: {self.score}
+All-time Best Score: {self.all_time_best_score}
 
 ID    age  size  fitness  adj fit  stag
 ====  ===  ====  =======  =======  ===="""
 
-                # 添加对齐的数据行
-                for i, (genome_id, genome) in enumerate(zip(range(len(self.ge)), self.ge)):
-                    if i < 5:  # 只显示前5个物种的信息
-                        stats_text += f"\n{i:<4}  {0:>3}  {3:>4}  {genome.fitness:>7.1f}  {'-':>7}  {0:>4}"
+            # 添加对齐的数据行
+            for i, (genome_id, genome) in enumerate(zip(range(len(self.ge)), self.ge)):
+                if i < 5:  # 只显示前5个物种的信息
+                    stats_text += f"\n{i:<4}  {0:>3}  {3:>4}  {genome.fitness:>7.1f}  {'-':>7}  {0:>4}"
 
-                # 更新显示（不再添加分隔行和下一代标题）
-                self.stats_window.update_stats(stats_text)
-                self.stats_window.draw(self.window, self.game_surface)
-                pygame.display.flip()
+            # 更新显示
+            self.stats_window.update_stats(stats_text)
+            self.stats_window.draw(self.window, self.game_surface)
+            
+        except Exception as e:
+            print(f"Error updating stats: {e}")
 
-                # 当所有小鸟死亡时
-                if len(self.birds) == 0:
-                    self.generation += 1  # 增加代数
-                    break  # 跳出内层循环，重新初始化种群
+def pretrain_with_human_data(config):
+    """使用人类玩家数据预训练网络"""
+    try:
+        # 加载所有高分数据（包括备份）
+        all_data = []
+        main_files = [f for f in os.listdir('.') 
+                     if f.startswith('human_play_data_') and f.endswith('.pkl')]
+        
+        # 处理主文件
+        for file in main_files:
+            # 从文件名中提取分数
+            score = int(file.split('_')[-2])  # 修改这里以获取分数
+            if score >= MIN_SCORE_TO_SAVE:
+                with open(file, 'rb') as f:
+                    data = pickle.load(f)
+                    all_data.extend(data)
+                    print(f"Loaded main data with score {score}")
+        
+        # 处理备份文件
+        if os.path.exists(BACKUP_DIR):
+            backup_files = [f for f in os.listdir(BACKUP_DIR) 
+                          if f.startswith('backup_human_play_data_') and f.endswith('.pkl')]
+            for file in backup_files:
+                score = int(file.split('_')[-2])  # 修改这里以获取分数
+                if score >= MIN_SCORE_TO_SAVE:
+                    backup_path = os.path.join(BACKUP_DIR, file)
+                    with open(backup_path, 'rb') as f:
+                        data = pickle.load(f)
+                        all_data.extend(data)
+                        print(f"Loaded backup data with score {score}")
+        
+        print(f"Loaded total {len(all_data)} human play examples")
+        
+        # 按分数排序，优先使用高分数的数据
+        all_data.sort(key=lambda x: x['score'], reverse=True)
+        
+        # 创建初始种群
+        pop = neat.Population(config)
+        
+        # 对每个基因组进行预训练
+        for genome_id, genome in pop.population.items():
+            net = neat.nn.FeedForwardNetwork.create(genome, config)
+            
+            # 使用人类数据训练
+            total_error = 0
+            for data_point in all_data:
+                state = data_point['state']
+                action = data_point['action']
+                score = data_point['score']
+                
+                # 获取网络输出
+                output = net.activate(state)
+                expected = 1 if action == 1 else 0
+                
+                # 计算误差，高分数据的误差权重更大
+                error = (output[0] - expected) ** 2
+                weighted_error = error * (1 + score/10)  # 分数越高，权重越大
+                total_error += weighted_error
+            
+            # 设置适应度（误差越小，适应度越高）
+            if total_error == 0:
+                genome.fitness = 100  # 避免除以零
+            else:
+                genome.fitness = 1.0 / total_error
+        
+        # 保存预训练的种群
+        with open("pretrained_population.pkl", "wb") as f:
+            pickle.dump(pop, f)
+            
+        return pop
+        
+    except Exception as e:
+        print(f"Error in pretraining: {e}")
+        return None
+
+def load_checkpoint(checkpoint_path, config):
+    """加载检查点"""
+    try:
+        # 修改加载方式，设置 weights_only=False
+        checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cpu')
+        
+        # 创建新的种群
+        pop = neat.Population(config)
+        
+        # 复制最佳基因组来填充种群
+        best_genome = checkpoint['best_genome']
+        
+        # 为每个个体创建新的基因组
+        for i in range(POPULATION_SIZE):
+            genome = neat.DefaultGenome(i)
+            genome.configure_new(config.genome_config)
+            genome.fitness = best_genome.fitness
+            # 复制基因组的连接和节点
+            for key, conn in best_genome.connections.items():
+                genome.connections[key] = conn.copy()
+            for key, node in best_genome.nodes.items():
+                genome.nodes[key] = node.copy()
+            pop.population[i] = genome
+            
+        pop.generation = checkpoint['generation']
+        
+        print(f"Loaded checkpoint from generation {checkpoint['generation']}")
+        print(f"Best fitness: {checkpoint['best_fitness']}")
+        print(f"Score: {checkpoint['score']}")
+        print(f"All-time best score: {checkpoint['all_time_best_score']}")
+        
+        return pop
+        
+    except Exception as e:
+        print(f"Error loading checkpoint: {e}")
+        return None
 
 def run_neat(config_path):
     """运行NEAT算法"""
@@ -465,17 +715,26 @@ def run_neat(config_path):
                            neat.DefaultSpeciesSet, neat.DefaultStagnation,
                            config_path)
         
-        p = neat.Population(config)
+        # 检查是否有检查点文件
+        checkpoint_files = sorted(glob.glob("checkpoints/checkpoint_gen_*.pth"))
+        if checkpoint_files:
+            # 加载最新的检查点
+            pop = load_checkpoint(checkpoint_files[-1], config)
+            if pop is None:
+                pop = neat.Population(config)
+        else:
+            # 如果没有检查点，创建新种群
+            pop = neat.Population(config)
         
         # 创建游戏实例
         game = Game()
         
         # 添加详细报告器（传入game实例）
         detailed_reporter = DetailedReporter(game)
-        p.add_reporter(detailed_reporter)
+        pop.add_reporter(detailed_reporter)
         
         # 运行进化过程
-        winner = p.run(game.eval_genomes)
+        winner = pop.run(game.eval_genomes)
         
         # 保存最佳网络
         with open("best.pickle", "wb") as f:

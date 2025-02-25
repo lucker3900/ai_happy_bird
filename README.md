@@ -12,24 +12,40 @@
 - 支持人类玩家模式
 
 ## 项目结构
+
 ├── ai_flappy_bird.py # AI训练主程序
+
 ├── game.py # 游戏核心逻辑
+
 ├── bird.py # 小鸟
+
 ├── pipe.py # 管道
+
 ├── StatsWindow.py # 统计窗口
+
 ├── DetailedReporter.py # 训练数据记录器
+
 ├── config-feedforward.txt # NEAT配置文件
+
 ├── 微软正黑体.ttf # 显示字体
 │
 ├── img/ # 图片资源
+
 │ ├── bg.png # 背景
+
 │ ├── bird1.png # 小鸟动画
+
 │ ├── bird2.png # 小鸟动画
+
 │ ├── ground.png # 地面
+
 │ └── pipe.png # 管道
 │
+
 └── training_data/ # 训练数据
+
 ├── scores_history.json # 分数历史
+
 └── checkpoints/ # 模型检查点
 
 ## 安装依赖
